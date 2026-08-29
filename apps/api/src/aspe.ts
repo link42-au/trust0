@@ -1,16 +1,250 @@
-import { computeFingerprint, parseProfile, parseRequest } from "@trust0/identity";
-import { compactVerify, decodeProtectedHeader, importJWK, type JWK } from "jose";
-import { and, eq } from "drizzle-orm";
+import {
+	computeFingerprint,
+	parseAspeUri,
+	parseProfile,
+	parseRequest,
+} from "@trust0/identity";
+import { and, eq, gt, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import {
+	compactVerify,
+	decodeProtectedHeader,
+	importJWK,
+	type JWK,
+} from "jose";
+import { executeAtomicBatch } from "./atomic";
 import * as schema from "./db/schema";
+import { type ApiDb, loadVerifiedChainState } from "./identity-state";
 import {
 	type AuthEnv,
 	requireAuth,
 	sessionMiddleware,
 } from "./middleware/session";
+import { classifyProfileUpdate } from "./policy";
 
 const aspe = new Hono<AuthEnv>();
+
+const aspeUriFor = (domain: string | undefined, fingerprint: string): string =>
+	`aspe:${domain || "trust0.app"}:${fingerprint}`;
+
+export const parseBoundAspeUriFingerprint = (
+	aspeUri: string,
+	configuredDomain: string | undefined,
+): string | null => {
+	const parsed = parseAspeUri(aspeUri);
+	if (!parsed) return null;
+
+	const expectedDomain = (configuredDomain || "trust0.app")
+		.trim()
+		.toLowerCase();
+	if (parsed.authority.toLowerCase() !== expectedDomain) return null;
+
+	return parsed.fingerprint;
+};
+
+export const emailChallengePublicResponse = (
+	email: string,
+	expiresAt: Date,
+) => ({
+	email,
+	expiresAt: expiresAt.toISOString(),
+});
+
+type EmailChallengeConsumption = {
+	verificationId: string;
+	signedChallenge: string;
+	fingerprint: string;
+	email: string;
+	now: Date;
+};
+
+type ProfileRotationPersistence = {
+	oldFingerprint: string;
+	newFingerprint: string;
+	profileJws: string;
+	userId: string;
+	identityId: string;
+	chainHeadId: string;
+	chainHeadSeqno: number;
+	chainHeadJws: string;
+	createdAt: Date;
+	updatedAt: Date;
+};
+
+type ProfileCreatePersistence = {
+	fingerprint: string;
+	profileJws: string;
+	userId: string;
+	createdAt: Date;
+	updatedAt: Date;
+};
+
+export async function persistGuardedProfileCreate(
+	db: ApiDb,
+	input: ProfileCreatePersistence,
+): Promise<boolean> {
+	const result = await db.insert(schema.cryptoProfile).select(sql`
+		select
+			${sql.param(input.fingerprint, schema.cryptoProfile.fingerprint)},
+			${sql.param(input.profileJws, schema.cryptoProfile.profileJws)},
+			${sql.param(input.userId, schema.cryptoProfile.userId)},
+			null,
+			${sql.param(input.createdAt, schema.cryptoProfile.createdAt)},
+			${sql.param(input.updatedAt, schema.cryptoProfile.updatedAt)}
+		where not exists (
+			select 1 from ${schema.cryptoProfile}
+			where ${schema.cryptoProfile.userId} = ${sql.param(input.userId, schema.cryptoProfile.userId)}
+		)
+		and not exists (
+			select 1 from ${schema.cryptoProfile}
+			where ${schema.cryptoProfile.fingerprint} = ${sql.param(input.fingerprint, schema.cryptoProfile.fingerprint)}
+		)
+	`);
+
+	return result.meta.changes === 1;
+}
+
+export async function persistGuardedProfileRotation(
+	db: ApiDb,
+	input: ProfileRotationPersistence,
+): Promise<boolean> {
+	const oldProfileStillOwned = and(
+		eq(schema.cryptoProfile.fingerprint, input.oldFingerprint),
+		eq(schema.cryptoProfile.userId, input.userId),
+		eq(schema.cryptoProfile.identityId, input.identityId),
+	);
+	const verifiedChainHeadIsCurrent = sql`exists (
+		select 1 from ${schema.sigchainLink}
+		where ${schema.sigchainLink.identityId} = ${sql.param(input.identityId, schema.sigchainLink.identityId)}
+			and ${schema.sigchainLink.id} = ${sql.param(input.chainHeadId, schema.sigchainLink.id)}
+			and ${schema.sigchainLink.seqno} = ${sql.param(input.chainHeadSeqno, schema.sigchainLink.seqno)}
+			and ${schema.sigchainLink.linkJws} = ${sql.param(input.chainHeadJws, schema.sigchainLink.linkJws)}
+			and not exists (
+				select 1 from ${schema.sigchainLink} as later_chain_link
+				where later_chain_link.identity_id = ${sql.param(input.identityId, schema.sigchainLink.identityId)}
+					and (
+						later_chain_link.seqno > ${sql.param(input.chainHeadSeqno, schema.sigchainLink.seqno)}
+						or (
+							later_chain_link.seqno = ${sql.param(input.chainHeadSeqno, schema.sigchainLink.seqno)}
+							and later_chain_link.id <> ${sql.param(input.chainHeadId, schema.sigchainLink.id)}
+						)
+					)
+			)
+	)`;
+	const oldProfileGuard = sql`exists (
+		select 1 from ${schema.cryptoProfile}
+		where ${schema.cryptoProfile.fingerprint} = ${sql.param(input.oldFingerprint, schema.cryptoProfile.fingerprint)}
+			and ${schema.cryptoProfile.userId} = ${sql.param(input.userId, schema.cryptoProfile.userId)}
+			and ${schema.cryptoProfile.identityId} = ${sql.param(input.identityId, schema.cryptoProfile.identityId)}
+	)`;
+	const newProfileIsThisRotation = sql`exists (
+		select 1 from ${schema.cryptoProfile}
+		where ${schema.cryptoProfile.fingerprint} = ${sql.param(input.newFingerprint, schema.cryptoProfile.fingerprint)}
+			and ${schema.cryptoProfile.userId} = ${sql.param(input.userId, schema.cryptoProfile.userId)}
+			and ${schema.cryptoProfile.identityId} = ${sql.param(input.identityId, schema.cryptoProfile.identityId)}
+			and ${schema.cryptoProfile.profileJws} = ${sql.param(input.profileJws, schema.cryptoProfile.profileJws)}
+	)`;
+	const guardedDependency = and(
+		oldProfileGuard,
+		newProfileIsThisRotation,
+		verifiedChainHeadIsCurrent,
+	);
+
+	const [insertResult, , , deleteResult] = await db.batch([
+		db.insert(schema.cryptoProfile).select(sql`
+			select
+				${sql.param(input.newFingerprint, schema.cryptoProfile.fingerprint)},
+				${sql.param(input.profileJws, schema.cryptoProfile.profileJws)},
+				${sql.param(input.userId, schema.cryptoProfile.userId)},
+				${sql.param(input.identityId, schema.cryptoProfile.identityId)},
+				${sql.param(input.createdAt, schema.cryptoProfile.createdAt)},
+				${sql.param(input.updatedAt, schema.cryptoProfile.updatedAt)}
+			from ${schema.cryptoProfile}
+			where ${oldProfileStillOwned}
+				and ${verifiedChainHeadIsCurrent}
+				and not exists (
+					select 1 from ${schema.cryptoProfile}
+					where ${schema.cryptoProfile.fingerprint} = ${sql.param(input.newFingerprint, schema.cryptoProfile.fingerprint)}
+				)
+		`),
+		db
+			.update(schema.username)
+			.set({ fingerprint: input.newFingerprint })
+			.where(
+				and(
+					eq(schema.username.fingerprint, input.oldFingerprint),
+					guardedDependency,
+				),
+			),
+		db
+			.update(schema.attestation)
+			.set({ fingerprint: input.newFingerprint })
+			.where(
+				and(
+					eq(schema.attestation.fingerprint, input.oldFingerprint),
+					guardedDependency,
+				),
+			),
+		db
+			.delete(schema.cryptoProfile)
+			.where(
+				and(
+					oldProfileStillOwned,
+					newProfileIsThisRotation,
+					verifiedChainHeadIsCurrent,
+				),
+			),
+	]);
+
+	return insertResult.meta.changes === 1 && deleteResult.meta.changes === 1;
+}
+
+export async function consumeEmailChallenge(
+	db: ApiDb,
+	input: EmailChallengeConsumption,
+): Promise<boolean> {
+	const attestationId = `email_${input.fingerprint}`;
+	const expiresAt = new Date(input.now.getTime() + 365 * 24 * 60 * 60 * 1000);
+	const challengeIsConsumable = and(
+		eq(schema.verification.id, input.verificationId),
+		eq(schema.verification.value, input.signedChallenge),
+		gt(schema.verification.expiresAt, input.now),
+	);
+
+	const [attestationResult, consumptionResult] = await db.batch([
+		db
+			.insert(schema.attestation)
+			.select(sql`
+				select
+					${sql.param(attestationId, schema.attestation.id)},
+					${sql.param(input.fingerprint, schema.attestation.fingerprint)},
+					${sql.param("email", schema.attestation.type)},
+					null,
+					null,
+					null,
+					${sql.param(input.email, schema.attestation.value)},
+					${sql.param("trust0.app", schema.attestation.attestedBy)},
+					${sql.param(input.now, schema.attestation.attestedAt)},
+					${sql.param(expiresAt, schema.attestation.expiresAt)}
+				from ${schema.verification}
+				where ${challengeIsConsumable}
+			`)
+			.onConflictDoUpdate({
+				target: schema.attestation.id,
+				set: {
+					value: input.email,
+					attestedAt: input.now,
+					expiresAt,
+				},
+			}),
+		db.delete(schema.verification).where(challengeIsConsumable),
+	]);
+
+	return (
+		attestationResult.meta.changes === 1 && consumptionResult.meta.changes === 1
+	);
+}
 
 // SPEC EXTENSION (APC-005): Ariadne spec does not mention CORS.
 // Browser-based ASPE clients need CORS headers for cross-origin fetch.
@@ -68,14 +302,14 @@ aspe.post("/.well-known/aspe/post/", requireAuth, async (c) => {
 		return c.json({ error: "Request body required" }, 400);
 	}
 
-	let request;
+	let request: Awaited<ReturnType<typeof parseRequest>>;
 	try {
 		request = await parseRequest(body);
 	} catch (err) {
 		return c.json({ error: `Invalid request: ${(err as Error).message}` }, 400);
 	}
 
-	const { action, fingerprint, profileJws } = request;
+	const { action, fingerprint, profileJws, aspeUri } = request;
 	const now = new Date();
 
 	if (action === "create") {
@@ -103,7 +337,10 @@ aspe.post("/.well-known/aspe/post/", requireAuth, async (c) => {
 			.limit(1);
 
 		if (userProfile) {
-			return c.json({ error: "User already has a profile. Use update action." }, 409);
+			return c.json(
+				{ error: "User already has a profile. Use update action." },
+				409,
+			);
 		}
 
 		const [existing] = await db
@@ -119,20 +356,32 @@ aspe.post("/.well-known/aspe/post/", requireAuth, async (c) => {
 			);
 		}
 
-		await db.insert(schema.cryptoProfile).values({
+		const created = await persistGuardedProfileCreate(db, {
 			fingerprint,
 			profileJws,
 			userId: user.id,
 			createdAt: now,
 			updatedAt: now,
 		});
+		if (!created) {
+			return c.json(
+				{ error: "User or fingerprint already has a profile." },
+				409,
+			);
+		}
 
-		return c.json({ fingerprint, uri: `aspe:${fingerprint}` }, 201);
+		return c.json(
+			{ fingerprint, uri: aspeUriFor(c.env.ASPE_DOMAIN, fingerprint) },
+			201,
+		);
 	}
 
 	if (action === "update") {
 		if (!profileJws) {
 			return c.json({ error: "profile_jws required for update" }, 400);
+		}
+		if (!aspeUri) {
+			return c.json({ error: "aspe_uri required for update" }, 400);
 		}
 
 		try {
@@ -147,10 +396,23 @@ aspe.post("/.well-known/aspe/post/", requireAuth, async (c) => {
 			);
 		}
 
+		const targetFingerprint = parseBoundAspeUriFingerprint(
+			aspeUri,
+			c.env.ASPE_DOMAIN,
+		);
+		if (!targetFingerprint) {
+			return c.json(
+				{
+					error: "Invalid aspe_uri or ASPE domain does not match this instance",
+				},
+				400,
+			);
+		}
+
 		const [existing] = await db
 			.select()
 			.from(schema.cryptoProfile)
-			.where(eq(schema.cryptoProfile.fingerprint, fingerprint))
+			.where(eq(schema.cryptoProfile.fingerprint, targetFingerprint))
 			.limit(1);
 
 		if (!existing) {
@@ -161,19 +423,124 @@ aspe.post("/.well-known/aspe/post/", requireAuth, async (c) => {
 			return c.json({ error: "Not authorized to update this profile" }, 403);
 		}
 
-		await db
-			.update(schema.cryptoProfile)
-			.set({ profileJws, updatedAt: now })
-			.where(eq(schema.cryptoProfile.fingerprint, fingerprint));
+		let verifiedChain: Awaited<
+			ReturnType<typeof loadVerifiedChainState>
+		> | null = null;
+		if (existing.identityId) {
+			try {
+				verifiedChain = await loadVerifiedChainState(db, existing.identityId);
+			} catch (err) {
+				return c.json(
+					{ error: `Cannot verify stored sigchain: ${(err as Error).message}` },
+					409,
+				);
+			}
+		}
 
-		return c.json({ fingerprint, uri: `aspe:${fingerprint}` });
+		if (existing.fingerprint === fingerprint) {
+			if (verifiedChain) {
+				try {
+					classifyProfileUpdate(
+						verifiedChain.state,
+						existing.fingerprint,
+						fingerprint,
+					);
+				} catch (err) {
+					return c.json({ error: (err as Error).message }, 409);
+				}
+			}
+
+			await db
+				.update(schema.cryptoProfile)
+				.set({ profileJws, updatedAt: now })
+				.where(eq(schema.cryptoProfile.fingerprint, existing.fingerprint));
+		} else {
+			if (!existing.identityId) {
+				return c.json(
+					{
+						error:
+							"Cannot rotate profile keys before the sigchain is initialized",
+					},
+					400,
+				);
+			}
+			if (!verifiedChain) {
+				return c.json({ error: "Cannot verify stored sigchain" }, 409);
+			}
+
+			try {
+				classifyProfileUpdate(
+					verifiedChain.state,
+					existing.fingerprint,
+					fingerprint,
+				);
+			} catch (err) {
+				return c.json({ error: (err as Error).message }, 403);
+			}
+
+			const [conflictingProfile] = await db
+				.select()
+				.from(schema.cryptoProfile)
+				.where(eq(schema.cryptoProfile.fingerprint, fingerprint))
+				.limit(1);
+
+			if (conflictingProfile) {
+				return c.json(
+					{ error: "A profile already exists for the new fingerprint" },
+					409,
+				);
+			}
+			const chainHead = verifiedChain.links[verifiedChain.links.length - 1];
+			if (!chainHead) {
+				return c.json({ error: "Cannot verify stored sigchain" }, 409);
+			}
+
+			const rotated = await persistGuardedProfileRotation(db, {
+				oldFingerprint: existing.fingerprint,
+				newFingerprint: fingerprint,
+				profileJws,
+				userId: user.id,
+				identityId: existing.identityId,
+				chainHeadId: chainHead.id,
+				chainHeadSeqno: chainHead.seqno,
+				chainHeadJws: chainHead.linkJws,
+				createdAt: existing.createdAt,
+				updatedAt: now,
+			});
+			if (!rotated) {
+				return c.json(
+					{ error: "Profile changed concurrently. Refetch it and retry." },
+					409,
+				);
+			}
+		}
+
+		return c.json({
+			fingerprint,
+			uri: aspeUriFor(c.env.ASPE_DOMAIN, fingerprint),
+		});
 	}
 
 	if (action === "delete") {
+		if (!aspeUri) {
+			return c.json({ error: "aspe_uri required for delete" }, 400);
+		}
+
+		const targetFingerprint = parseBoundAspeUriFingerprint(
+			aspeUri,
+			c.env.ASPE_DOMAIN,
+		);
+		if (!targetFingerprint || targetFingerprint !== fingerprint) {
+			return c.json(
+				{ error: "Invalid aspe_uri, ASPE domain, or target fingerprint" },
+				400,
+			);
+		}
+
 		const [existing] = await db
 			.select()
 			.from(schema.cryptoProfile)
-			.where(eq(schema.cryptoProfile.fingerprint, fingerprint))
+			.where(eq(schema.cryptoProfile.fingerprint, targetFingerprint))
 			.limit(1);
 
 		if (!existing) {
@@ -184,24 +551,35 @@ aspe.post("/.well-known/aspe/post/", requireAuth, async (c) => {
 			return c.json({ error: "Not authorized to delete this profile" }, 403);
 		}
 
-		// Cascade delete: sigchain links, attestations, usernames, then profile
+		// D1 batch is transactional: either the complete cascade commits or none does.
 		if (existing.identityId) {
-			await db
-				.delete(schema.sigchainLink)
-				.where(eq(schema.sigchainLink.identityId, existing.identityId));
+			await executeAtomicBatch(db, [
+				db
+					.delete(schema.sigchainLink)
+					.where(eq(schema.sigchainLink.identityId, existing.identityId)),
+				db
+					.delete(schema.attestation)
+					.where(eq(schema.attestation.fingerprint, fingerprint)),
+				db
+					.delete(schema.username)
+					.where(eq(schema.username.fingerprint, fingerprint)),
+				db
+					.delete(schema.cryptoProfile)
+					.where(eq(schema.cryptoProfile.fingerprint, fingerprint)),
+			]);
+		} else {
+			await executeAtomicBatch(db, [
+				db
+					.delete(schema.attestation)
+					.where(eq(schema.attestation.fingerprint, fingerprint)),
+				db
+					.delete(schema.username)
+					.where(eq(schema.username.fingerprint, fingerprint)),
+				db
+					.delete(schema.cryptoProfile)
+					.where(eq(schema.cryptoProfile.fingerprint, fingerprint)),
+			]);
 		}
-
-		await db
-			.delete(schema.attestation)
-			.where(eq(schema.attestation.fingerprint, fingerprint));
-
-		await db
-			.delete(schema.username)
-			.where(eq(schema.username.fingerprint, fingerprint));
-
-		await db
-			.delete(schema.cryptoProfile)
-			.where(eq(schema.cryptoProfile.fingerprint, fingerprint));
 
 		return c.json({ deleted: true });
 	}
@@ -371,6 +749,9 @@ aspe.post("/api/identity/email/challenge", requireAuth, async (c) => {
 	if (!user.email || !user.emailVerified) {
 		return c.json({ error: "No verified email on account" }, 400);
 	}
+	if (!c.env.RESEND_API_KEY) {
+		return c.json({ error: "Email service not configured" }, 500);
+	}
 	const db = c.get("db");
 
 	const [profile] = await db
@@ -380,12 +761,17 @@ aspe.post("/api/identity/email/challenge", requireAuth, async (c) => {
 		.limit(1);
 
 	if (!profile) {
-		return c.json({ error: "No crypto profile found. Create a profile first." }, 404);
+		return c.json(
+			{ error: "No crypto profile found. Create a profile first." },
+			404,
+		);
 	}
 
 	// Generate random challenge
 	const challengeBytes = crypto.getRandomValues(new Uint8Array(32));
-	const challenge = Array.from(challengeBytes, (b) => b.toString(16).padStart(2, "0")).join("");
+	const challenge = Array.from(challengeBytes, (b) =>
+		b.toString(16).padStart(2, "0"),
+	).join("");
 
 	const now = new Date();
 	const expiresAt = new Date(now.getTime() + 15 * 60 * 1000); // 15 minutes
@@ -408,10 +794,6 @@ aspe.post("/api/identity/email/challenge", requireAuth, async (c) => {
 		});
 
 	// Send email via Resend
-	if (!c.env.RESEND_API_KEY) {
-		return c.json({ error: "Email service not configured" }, 500);
-	}
-
 	const { Resend } = await import("resend");
 	const resend = new Resend(c.env.RESEND_API_KEY);
 	const from = c.env.EMAIL_FROM || "trust0 <noreply@trust0.app>";
@@ -429,13 +811,16 @@ aspe.post("/api/identity/email/challenge", requireAuth, async (c) => {
 		`,
 	});
 
-	return c.json({ challenge, email: user.email, expiresAt: expiresAt.toISOString() });
+	return c.json(emailChallengePublicResponse(user.email, expiresAt));
 });
 
 // Step 2: Verify signed challenge and create attestation
 aspe.post("/api/identity/email/verify", requireAuth, async (c) => {
 	const user = c.get("user");
 	if (!user) return c.json({ error: "Unauthorized" }, 401);
+	if (typeof user.email !== "string" || !user.email) {
+		return c.json({ error: "No email on account" }, 400);
+	}
 	const db = c.get("db");
 
 	const body = await c.req.json<{ signedChallenge: string }>();
@@ -444,14 +829,18 @@ aspe.post("/api/identity/email/verify", requireAuth, async (c) => {
 	}
 
 	// Parse the JWS to extract the challenge and signer's key
-	let header;
+	let header: ReturnType<typeof decodeProtectedHeader>;
 	try {
 		header = decodeProtectedHeader(body.signedChallenge);
 	} catch {
 		return c.json({ error: "Invalid JWS format" }, 400);
 	}
 
-	if (!header.jwk || typeof header.jwk !== "object" || typeof header.kid !== "string") {
+	if (
+		!header.jwk ||
+		typeof header.jwk !== "object" ||
+		typeof header.kid !== "string"
+	) {
 		return c.json({ error: "JWS must include jwk and kid in header" }, 400);
 	}
 
@@ -479,7 +868,10 @@ aspe.post("/api/identity/email/verify", requireAuth, async (c) => {
 		.limit(1);
 
 	if (!profile || profile.userId !== user.id) {
-		return c.json({ error: "Profile not found or not owned by this user" }, 403);
+		return c.json(
+			{ error: "Profile not found or not owned by this user" },
+			403,
+		);
 	}
 
 	// Extract and verify the challenge
@@ -493,7 +885,10 @@ aspe.post("/api/identity/email/verify", requireAuth, async (c) => {
 		.limit(1);
 
 	if (!verification) {
-		return c.json({ error: "No pending challenge found. Request a new one." }, 400);
+		return c.json(
+			{ error: "No pending challenge found. Request a new one." },
+			400,
+		);
 	}
 
 	if (verification.expiresAt < new Date()) {
@@ -504,31 +899,26 @@ aspe.post("/api/identity/email/verify", requireAuth, async (c) => {
 		return c.json({ error: "Challenge does not match" }, 400);
 	}
 
-	// Challenge verified — create attestation
+	// Challenge verified — atomically consume it and create the attestation.
+	// The guarded INSERT prevents a concurrent verifier from attesting after the
+	// first transaction has deleted the one-time challenge.
 	const now = new Date();
-
-	await db
-		.insert(schema.attestation)
-		.values({
-			id: `email_${fingerprint}`,
-			fingerprint,
-			type: "email",
-			value: user.email!,
-			attestedBy: "trust0.app",
-			attestedAt: now,
-			expiresAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000),
-		})
-		.onConflictDoUpdate({
-			target: schema.attestation.id,
-			set: {
-				value: user.email!,
-				attestedAt: now,
-				expiresAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000),
+	const consumed = await consumeEmailChallenge(db, {
+		verificationId,
+		signedChallenge,
+		fingerprint,
+		email: user.email,
+		now,
+	});
+	if (!consumed) {
+		return c.json(
+			{
+				error:
+					"Challenge already consumed or no longer valid. Request a new one.",
 			},
-		});
-
-	// Clean up used challenge
-	await db.delete(schema.verification).where(eq(schema.verification.id, verificationId));
+			409,
+		);
+	}
 
 	return c.json({
 		fingerprint,

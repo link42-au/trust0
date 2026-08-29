@@ -13,6 +13,7 @@ type Env = {
 
 const MAX_RESPONSE_SIZE = 1_048_576; // 1 MB
 const FETCH_TIMEOUT_MS = 10_000;
+const MAX_REDIRECTS = 5;
 
 /** RFC 1918 / loopback / link-local prefixes that must never be proxied to. */
 const PRIVATE_HOST_PATTERNS = [
@@ -44,7 +45,41 @@ const requireHttps = (url: string): URL => {
 	return parsed;
 };
 
-const fetchWithTimeout = async (
+export const aspeUriToProfileUrl = (aspeUri: string): string | null => {
+	if (!aspeUri.startsWith("aspe:")) return null;
+
+	const fingerprintSeparator = aspeUri.lastIndexOf(":");
+	if (fingerprintSeparator <= "aspe:".length) return null;
+
+	const authority = aspeUri.slice("aspe:".length, fingerprintSeparator);
+	const fingerprint = aspeUri.slice(fingerprintSeparator + 1);
+	if (!/^[a-zA-Z2-7]{26}$/.test(fingerprint)) return null;
+
+	const authorityMatch = authority.match(
+		/^([a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?)(?::(\d{1,5}))?$/,
+	);
+	if (!authorityMatch) return null;
+
+	const hostname = authorityMatch[1];
+	const labels = hostname.split(".");
+	if (
+		hostname.length > 253 ||
+		labels.some(
+			(label) =>
+				label.length > 63 ||
+				!/^[a-zA-Z0-9](?:[a-zA-Z0-9_-]*[a-zA-Z0-9])?$/.test(label),
+		)
+	) {
+		return null;
+	}
+
+	const port = authorityMatch[2];
+	if (port && Number.parseInt(port, 10) > 65_535) return null;
+
+	return `https://${authority}/.well-known/aspe/id/${fingerprint.toUpperCase()}`;
+};
+
+export const fetchWithTimeout = async (
 	input: RequestInfo,
 	init?: RequestInit,
 ): Promise<Response> => {
@@ -52,11 +87,80 @@ const fetchWithTimeout = async (
 	const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
 	try {
-		const res = await fetch(input, {
-			...init,
-			signal: controller.signal,
-		});
-		return res;
+		let requestUrl = requireHttps(
+			typeof input === "string" ? input : input.url,
+		);
+		requestUrl.hash = "";
+		let requestInit: RequestInit = { ...init };
+		const visited = new Set<string>([requestUrl.toString()]);
+
+		for (let redirectCount = 0; ; redirectCount += 1) {
+			const res = await fetch(requestUrl.toString(), {
+				...requestInit,
+				redirect: "manual",
+				signal: controller.signal,
+			});
+
+			if (![301, 302, 303, 307, 308].includes(res.status)) {
+				return res;
+			}
+			if (redirectCount >= MAX_REDIRECTS) {
+				throw new Error("Too many redirects");
+			}
+
+			const location = res.headers.get("location");
+			if (!location) {
+				throw new Error("Redirect response is missing a Location header");
+			}
+
+			let redirectUrl: URL;
+			try {
+				redirectUrl = requireHttps(new URL(location, requestUrl).toString());
+			} catch (err) {
+				const message =
+					err instanceof Error ? err.message : "Invalid redirect URL";
+				throw new Error(`Unsafe redirect: ${message}`);
+			}
+			redirectUrl.hash = "";
+
+			const normalizedRedirectUrl = redirectUrl.toString();
+			if (visited.has(normalizedRedirectUrl)) {
+				throw new Error("Redirect loop detected");
+			}
+			visited.add(normalizedRedirectUrl);
+
+			const method = (requestInit.method || "GET").toUpperCase();
+			const headers = new Headers(requestInit.headers);
+			const switchToGet =
+				(res.status === 303 && method !== "GET" && method !== "HEAD") ||
+				((res.status === 301 || res.status === 302) && method === "POST");
+			if (switchToGet) {
+				for (const header of [
+					"content-encoding",
+					"content-language",
+					"content-length",
+					"content-location",
+					"content-type",
+				]) {
+					headers.delete(header);
+				}
+				requestInit = {
+					...requestInit,
+					method: "GET",
+					body: undefined,
+					headers,
+				};
+			}
+			if (requestUrl.origin !== redirectUrl.origin) {
+				headers.delete("authorization");
+				headers.delete("cookie");
+				headers.delete("proxy-authorization");
+				requestInit = { ...requestInit, headers };
+			}
+
+			await res.body?.cancel();
+			requestUrl = redirectUrl;
+		}
 	} finally {
 		clearTimeout(timer);
 	}
@@ -293,17 +397,14 @@ app.get("/api/3/get/aspe", async (c) => {
 		return c.json({ error: "Missing 'aspeUri' parameter" }, 400);
 	}
 
-	// ASPE URI format: aspe:domain.example:fingerprint
-	const match = aspeUri.match(/^aspe:([a-zA-Z0-9.\-_]+):([a-zA-Z0-9]+)/);
-	if (!match) {
+	const profileUrl = aspeUriToProfileUrl(aspeUri);
+	if (!profileUrl) {
 		return c.json({ error: "Invalid ASPE URI" }, 400);
 	}
 
-	const [, domain, fingerprint] = match;
-	const url = `https://${domain}/.well-known/aspe/id/${fingerprint.toUpperCase()}`;
-
 	try {
-		const res = await fetchWithTimeout(url, {
+		const url = requireHttps(profileUrl);
+		const res = await fetchWithTimeout(url.toString(), {
 			headers: {
 				Accept: "application/asp+jwt",
 				"User-Agent": "identity-proxy/0.1",
@@ -321,7 +422,8 @@ app.get("/api/3/get/aspe", async (c) => {
 
 		return new Response(body, {
 			headers: {
-				"Content-Type": res.headers.get("content-type") || "application/asp+jwt",
+				"Content-Type":
+					res.headers.get("content-type") || "application/asp+jwt",
 			},
 		});
 	} catch (err) {

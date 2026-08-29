@@ -1,7 +1,6 @@
 <script lang="ts">
 	import { onMount } from "svelte";
 	import { getMe, type MeResponse } from "$lib/api";
-	import { Claim, enums } from "@trust0/verify";
 	import {
 		getStoredIdentity,
 		fetchMyProfile,
@@ -70,6 +69,10 @@
 		try {
 			const cleanDomain = domain.trim();
 			const claimUri = `dns:${cleanDomain}?type=TXT`;
+			const [{ Claim }, enums] = await Promise.all([
+				import("@trust0/verify/claim"),
+				import("@trust0/verify/enums"),
+			]);
 
 			// Use doipjs for verification (consistent with profile viewer)
 			const claim = new Claim(claimUri, identity.fingerprint);

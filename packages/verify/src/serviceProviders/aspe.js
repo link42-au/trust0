@@ -18,14 +18,60 @@ limitations under the License.
  * @module serviceProviders/aspe
  * @example
  * import { ServiceProviderDefinitions } from 'doipjs';
- * const sp = ServiceProviderDefinitions.data.activitypub.processURI('aspe:domain.example:abc123def456');
+ * const sp = ServiceProviderDefinitions.data.aspe.processURI('aspe:domain.example:QPRGVPJNWDXH4ESK2RYDTZJLTE');
  */
 
 import isFQDN from 'validator/lib/isFQDN.js'
 import * as E from '../enums.js'
 import { ServiceProvider } from '../serviceProvider.js'
 
-export const reURI = /^aspe:([a-zA-Z0-9.\-_]*):([a-zA-Z0-9]*)/
+const ASPE_PREFIX = 'aspe:'
+const FINGERPRINT_PATTERN = /^[A-Z2-7]{26}$/i
+
+export const reURI = /^aspe:([^:/?#\s]+(?::[0-9]{1,5})?):([A-Za-z2-7]{26})$/
+
+/**
+ * Parse and validate a canonical ASPE URI.
+ * @param {string} uri - ASPE URI to parse
+ * @returns {{ authority: string, fingerprint: string } | null} Parsed URI data
+ */
+export function parseAspeUri (uri) {
+  if (typeof uri !== 'string' || !uri.startsWith(ASPE_PREFIX)) {
+    return null
+  }
+
+  const fingerprintSeparator = uri.lastIndexOf(':')
+  if (fingerprintSeparator < ASPE_PREFIX.length) {
+    return null
+  }
+
+  const authority = uri.slice(ASPE_PREFIX.length, fingerprintSeparator)
+  const fingerprint = uri.slice(fingerprintSeparator + 1)
+  if (!authority || !FINGERPRINT_PATTERN.test(fingerprint)) {
+    return null
+  }
+
+  const portSeparator = authority.lastIndexOf(':')
+  const hostname = portSeparator === -1
+    ? authority
+    : authority.slice(0, portSeparator)
+  const port = portSeparator === -1
+    ? null
+    : authority.slice(portSeparator + 1)
+
+  if (port !== null && (!/^\d{1,5}$/.test(port) || Number(port) > 65535)) {
+    return null
+  }
+
+  if (hostname.toLowerCase() !== 'localhost' && !isFQDN(hostname)) {
+    return null
+  }
+
+  return {
+    authority,
+    fingerprint: fingerprint.toUpperCase()
+  }
+}
 
 /**
  * @function
@@ -33,11 +79,12 @@ export const reURI = /^aspe:([a-zA-Z0-9.\-_]*):([a-zA-Z0-9]*)/
  * @returns {ServiceProvider} The service provider information based on the claim URI
  */
 export function processURI (uri) {
-  const match = uri.match(reURI)
-
-  if (!isFQDN(match[1])) {
+  const parsed = parseAspeUri(uri)
+  if (!parsed) {
     return null
   }
+
+  const canonicalUri = `${ASPE_PREFIX}${parsed.authority}:${parsed.fingerprint}`
 
   return new ServiceProvider({
     about: {
@@ -45,8 +92,8 @@ export function processURI (uri) {
       name: 'ASPE'
     },
     profile: {
-      display: uri,
-      uri,
+      display: canonicalUri,
+      uri: canonicalUri,
       qr: null
     },
     claim: {
@@ -59,7 +106,7 @@ export function processURI (uri) {
         fetcher: E.Fetcher.ASPE,
         accessRestriction: E.ProofAccessRestriction.NONE,
         data: {
-          aspeUri: uri
+          aspeUri: canonicalUri
         }
       },
       response: {
@@ -77,7 +124,11 @@ export function processURI (uri) {
 
 export const tests = [
   {
-    uri: 'aspe:domain.tld:abc123def456',
+    uri: 'aspe:domain.tld:QPRGVPJNWDXH4ESK2RYDTZJLTE',
+    shouldMatch: true
+  },
+  {
+    uri: 'aspe:localhost:8788:qprgvpjnwdxh4esk2rydtzjlte',
     shouldMatch: true
   },
   {
@@ -90,6 +141,26 @@ export const tests = [
   },
   {
     uri: 'https://domain.tld',
+    shouldMatch: false
+  },
+  {
+    uri: 'ASPE:domain.tld:QPRGVPJNWDXH4ESK2RYDTZJLTE',
+    shouldMatch: false
+  },
+  {
+    uri: 'aspe:domain.tld:QPRGVPJNWDXH4ESK2RYDTZJLTE/path',
+    shouldMatch: false
+  },
+  {
+    uri: 'aspe:domain.tld:QPRGVPJNWDXH4ESK2RYDTZJLTE:extra',
+    shouldMatch: false
+  },
+  {
+    uri: 'aspe:domain.tld:QPRGVPJNWDXH4ESK2RYDTZJLT0',
+    shouldMatch: false
+  },
+  {
+    uri: 'aspe:localhost:999999:QPRGVPJNWDXH4ESK2RYDTZJLTE',
     shouldMatch: false
   }
 ]

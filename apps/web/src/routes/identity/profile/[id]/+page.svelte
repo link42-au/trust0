@@ -2,7 +2,6 @@
 	import { onMount } from "svelte";
 	import { page } from "$app/state";
 	import { parseProfile, verifyChain, type ChainState } from "@trust0/identity";
-	import { Claim, enums } from "@trust0/verify";
 	import { fetchChain, fetchIdentityById, type ChainResponse } from "$lib/identity";
 
 	const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8788";
@@ -174,6 +173,10 @@
 
 		// All other claims — use doipjs
 		try {
+			const [{ Claim }, enums] = await Promise.all([
+				import("@trust0/verify/claim"),
+				import("@trust0/verify/enums"),
+			]);
 			const claim = new Claim(uri, fingerprint);
 			claim.match();
 
@@ -283,7 +286,9 @@
 
 		<div class="profile-meta">
 			<span class="meta-item" title={fingerprint}>
-				🔑 <code onclick={copyFingerprint} style="cursor: pointer;">{fingerprint.slice(0, 8)}...{fingerprint.slice(-4)}</code>
+				🔑 <button type="button" class="fingerprint-copy" onclick={copyFingerprint}>
+					<code>{fingerprint.slice(0, 8)}...{fingerprint.slice(-4)}</code>
+				</button>
 			</span>
 			{#if chainState}
 				<span class="meta-item">🔗 {chainState.links.length} chain links</span>
@@ -398,8 +403,6 @@
 				<p class="chain-verify-note">Chain verified client-side in your browser.</p>
 			</div>
 		{/if}
-	</div>
-
 	<div class="verification-notice">
 		<small>Client verifications performed in your browser. Server-attested claims were witnessed by the platform's verification bots.</small>
 	</div>
@@ -473,6 +476,14 @@
 		font-size: 0.75rem;
 	}
 
+	.fingerprint-copy {
+		border: 0;
+		padding: 0;
+		background: transparent;
+		color: inherit;
+		cursor: pointer;
+	}
+
 	.profile-actions {
 		display: flex;
 		gap: 8px;
@@ -502,12 +513,6 @@
 	}
 
 	/* ── Legacy styles (still used in claims section) ── */
-
-	.fingerprint-row {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-	}
 
 	.profile-detail {
 		margin-bottom: 16px;
@@ -652,9 +657,4 @@
 		display: block;
 	}
 
-	.qr-label {
-		font-size: 0.75rem;
-		color: var(--text-dim);
-		margin-top: 8px;
-	}
 </style>

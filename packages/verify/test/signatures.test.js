@@ -18,6 +18,7 @@ import chaiAsPromised from 'chai-as-promised'
 use(chaiAsPromised)
 
 import { Profile, signatures } from '../src/index.js'
+import { installOpenPgpFixtureHkp } from './fixtures/openpgp.js'
 
 const sigProfile = `-----BEGIN PGP SIGNED MESSAGE-----
 Hash: SHA512
@@ -83,6 +84,16 @@ YCKJPotiqe50nBijHHbuABtBianiMZOm2BbaPnsmdHIX5ynWhOI8LHR1CVmTI/0o
 -----END PGP SIGNATURE-----`
 
 describe('signatures.parse', () => {
+  let openPgpFixture
+
+  before(async () => {
+    openPgpFixture = await installOpenPgpFixtureHkp()
+  })
+
+  after(() => {
+    openPgpFixture.restore()
+  })
+
   it('should be a function (2 arguments)', () => {
     expect(signatures.parse).to.be.a('function')
     expect(signatures.parse).to.have.length(1)
@@ -94,6 +105,14 @@ describe('signatures.parse', () => {
       'openpgp4fpr:3637202523e7c1309ab79e99ef2dc5827b445f4b'
     )
     expect(profile.personas[0].claims).to.be.length(1)
+    expect(profile.publicKey.fetch.method).to.be.equal('hkp')
+    expect(profile.publicKey.fetch.query).to.be.equal('ef2dc5827b445f4b')
+    expect(openPgpFixture.calls.map(({ protocol }) => protocol)).to.deep.equal([
+      'wkd',
+      'hkp'
+    ])
+    expect(openPgpFixture.calls[1].query).to.equal('ef2dc5827b445f4b')
+    expect(openPgpFixture.calls[1].url).to.contain('ef2dc5827b445f4b')
   })
   it('should reject an invalid signature', async () => {
     return expect(

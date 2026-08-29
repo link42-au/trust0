@@ -147,7 +147,7 @@ export async function parseProfileJws (profileJws, uri) {
     pe.themeColor = profileThemeColor
   }
   if (profileAvatarUrl) {
-    pe.setAvatarUrl(profileAvatarUrl);
+    pe.setAvatarUrl(profileAvatarUrl)
   }
 
   const profile = new Profile(ProfileType.ASP, uri, [pe])

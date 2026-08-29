@@ -3,11 +3,21 @@ import {
 	computeLinkHash,
 	type ParsedChainLink,
 	parseChainLink,
+	verifyChain,
 } from "@trust0/identity";
-import { asc, desc, eq } from "drizzle-orm";
+import { and, asc, eq, isNull, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import * as schema from "./db/schema";
+import {
+	findOwnedProfileByIdentityId,
+	loadVerifiedChainState,
+} from "./identity-state";
 import { type AuthEnv, sessionMiddleware } from "./middleware/session";
+import {
+	assertAppendAuthorized,
+	assertAppendPreservesProfileState,
+	assertProfileOwnedByUser,
+} from "./policy";
 
 const sigchain = new Hono<AuthEnv>();
 
@@ -124,7 +134,9 @@ sigchain.post("/api/identity/chain/init", async (c) => {
 		return c.json({ error: "Crypto profile not found for this key" }, 404);
 	}
 
-	if (profile.userId !== user.id) {
+	try {
+		assertProfileOwnedByUser(profile.userId, user.id);
+	} catch {
 		return c.json({ error: "Forbidden" }, 403);
 	}
 
@@ -145,23 +157,45 @@ sigchain.post("/api/identity/chain/init", async (c) => {
 		);
 	}
 
+	try {
+		await verifyChain([body.genesisLinkJws], identityId);
+	} catch (err) {
+		return c.json(
+			{ error: `Invalid genesis chain state: ${(err as Error).message}` },
+			400,
+		);
+	}
+
 	const now = new Date();
 
-	await db.insert(schema.sigchainLink).values({
-		id: linkHash,
-		identityId,
-		fingerprint: parsed.fingerprint,
-		seqno: 0,
-		linkType: "key_init",
-		linkJws: body.genesisLinkJws,
-		prevHash: null,
-		createdAt: now,
-	});
+	const uninitializedOwnedProfile = and(
+		eq(schema.cryptoProfile.fingerprint, parsed.fingerprint),
+		eq(schema.cryptoProfile.userId, user.id),
+		isNull(schema.cryptoProfile.identityId),
+	);
+	const [insertResult, updateResult] = await db.batch([
+		db.insert(schema.sigchainLink).select(sql`
+			select
+				${sql.param(linkHash, schema.sigchainLink.id)},
+				${sql.param(identityId, schema.sigchainLink.identityId)},
+				${sql.param(parsed.fingerprint, schema.sigchainLink.fingerprint)},
+				0,
+				${sql.param("key_init", schema.sigchainLink.linkType)},
+				${sql.param(body.genesisLinkJws, schema.sigchainLink.linkJws)},
+				null,
+				${sql.param(now, schema.sigchainLink.createdAt)}
+			from ${schema.cryptoProfile}
+			where ${uninitializedOwnedProfile}
+		`),
+		db
+			.update(schema.cryptoProfile)
+			.set({ identityId })
+			.where(uninitializedOwnedProfile),
+	]);
 
-	await db
-		.update(schema.cryptoProfile)
-		.set({ identityId })
-		.where(eq(schema.cryptoProfile.fingerprint, parsed.fingerprint));
+	if (insertResult.meta.changes !== 1 || updateResult.meta.changes !== 1) {
+		return c.json({ error: "Chain already initialized for this profile" }, 409);
+	}
 
 	return c.json({ identityId }, 201);
 });
@@ -189,49 +223,46 @@ sigchain.post("/api/identity/chain/append", async (c) => {
 		);
 	}
 
-	// Validate fingerprint ownership
-	const [profile] = await db
-		.select()
-		.from(schema.cryptoProfile)
-		.where(eq(schema.cryptoProfile.fingerprint, parsed.fingerprint))
-		.limit(1);
-
-	if (!profile) {
-		return c.json({ error: "Crypto profile not found for this key" }, 404);
-	}
-
-	if (profile.userId !== user.id) {
-		return c.json({ error: "Forbidden" }, 403);
-	}
-
-	if (!profile.identityId) {
+	if (parsed.seqno === 0) {
 		return c.json(
-			{ error: "Chain not initialized. Call /api/identity/chain/init first." },
+			{ error: "Genesis links must be created via /api/identity/chain/init" },
 			400,
 		);
 	}
 
-	const identityId = profile.identityId;
-
-	// Get the last link in the chain
 	const [lastLink] = await db
 		.select()
 		.from(schema.sigchainLink)
-		.where(eq(schema.sigchainLink.identityId, identityId))
-		.orderBy(desc(schema.sigchainLink.seqno))
+		.where(eq(schema.sigchainLink.id, parsed.prev!))
 		.limit(1);
 
 	if (!lastLink) {
 		return c.json(
-			{ error: "Chain has no links. This should not happen." },
+			{ error: "prev hash does not match a known link in the chain" },
 			400,
 		);
 	}
 
+	const identityId = lastLink.identityId;
+
+	const ownerProfile = await findOwnedProfileByIdentityId(
+		db,
+		user.id,
+		identityId,
+	);
+	if (!ownerProfile) {
+		return c.json({ error: "Forbidden" }, 403);
+	}
+
+	const { links, state } = await loadVerifiedChainState(db, identityId);
+	const currentLastLink = links[links.length - 1];
+
 	// Validate seqno continuity
-	if (parsed.seqno !== lastLink.seqno + 1) {
+	if (parsed.seqno !== currentLastLink.seqno + 1) {
 		return c.json(
-			{ error: `Expected seqno ${lastLink.seqno + 1}, got ${parsed.seqno}` },
+			{
+				error: `Expected seqno ${currentLastLink.seqno + 1}, got ${parsed.seqno}`,
+			},
 			400,
 		);
 	}
@@ -239,7 +270,7 @@ sigchain.post("/api/identity/chain/append", async (c) => {
 	// Validate prev hash
 	let expectedPrevHash: string;
 	try {
-		expectedPrevHash = await computeLinkHash(lastLink.linkJws);
+		expectedPrevHash = await computeLinkHash(currentLastLink.linkJws);
 	} catch (err) {
 		return c.json(
 			{ error: `Failed to compute prev hash: ${(err as Error).message}` },
@@ -250,6 +281,30 @@ sigchain.post("/api/identity/chain/append", async (c) => {
 	if (parsed.prev !== expectedPrevHash) {
 		return c.json(
 			{ error: "prev hash does not match the last link in the chain" },
+			400,
+		);
+	}
+
+	try {
+		assertAppendAuthorized(state, parsed.fingerprint);
+	} catch (err) {
+		return c.json({ error: (err as Error).message }, 403);
+	}
+
+	try {
+		const nextState = await verifyChain(
+			[...links.map((link) => link.linkJws), body.linkJws],
+			identityId,
+		);
+		assertAppendPreservesProfileState(
+			state,
+			nextState,
+			ownerProfile.fingerprint,
+			parsed.type,
+		);
+	} catch (err) {
+		return c.json(
+			{ error: `Invalid sigchain transition: ${(err as Error).message}` },
 			400,
 		);
 	}
@@ -281,7 +336,13 @@ sigchain.post("/api/identity/chain/append", async (c) => {
 		// Unique constraint on (identity_id, seqno) — concurrent append race
 		const message = (err as Error).message || "";
 		if (message.includes("UNIQUE") || message.includes("unique")) {
-			return c.json({ error: "Conflict: another link was appended concurrently. Refetch chain and retry." }, 409);
+			return c.json(
+				{
+					error:
+						"Conflict: another link was appended concurrently. Refetch chain and retry.",
+				},
+				409,
+			);
 		}
 		throw err;
 	}

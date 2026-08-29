@@ -18,35 +18,14 @@ import chaiAsPromised from 'chai-as-promised'
 use(chaiAsPromised)
 
 import { openpgp, Profile } from '../src/index.js'
+import {
+  installOpenPgpFixtureHkp,
+  publicKeyArmored,
+  publicKeyEmail as pubKeyEmail,
+  publicKeyFingerprint as pubKeyFingerprint
+} from './fixtures/openpgp.js'
 
-const pubKeyFingerprint = "3637202523e7c1309ab79e99ef2dc5827b445f4b"
-const pubKeyEmail = "test@doip.rocks"
-
-const pubKeyPlaintext = `-----BEGIN PGP PUBLIC KEY BLOCK-----
-
-mQGNBF+036UBDACoxWRdp7rBAFB2l/+dxX0XA50NJC92EEacB5L0TnC0lP/MsNHv
-fAv/A9vgTwrPudvcHdE/urAjQswfIU3LpFxbBOWNYWOv6ssrzBH4vVGMyxfu2GGu
-b2mxjWj0eWXnWXnzkO5fscX2y0HqNjBZjDSkYohHZJTbz91NnxK3a8+Erpk+sgEH
-hQH1h75SfaW6GZucuhenxgjwEiGz84UEVS0AEWD9yNgfWCsK/6HuIRnv5Jv5V9z9
-bx9Ik7QNGBks3tpNmdbeaaadkHYZpF3Fm8mCoIt2+Xx9OvyuLssZnVkuQdj8C2/z
-E45If4+pHRnRcCWXpDrHUWoJaeyGuTq5triePI6h/4lgr/m/du0O/lhOrr6MUhAe
-7xc0B+X+bTF/balZmmlbk5bnDoZMzdH8caui5XrkuRif/I0nYPRnc9zrqWJDDO/p
-nltpMPrUMTjoiXZ8DbJ4WMK7QPdsbG8Tz/Vl3wigEmwPLfEGifLpec5RXrti5Zd9
-FiSOIOetP8p8MSMAEQEAAbRBWWFybW8gTWFja2VuYmFjaCAobWF0ZXJpYWwgZm9y
-IHRlc3QgZnJhbWV3b3JrcykgPHRlc3RAZG9pcC5yb2Nrcz6JAhAEEwEKAHoCGwMF
-CwkIBwIGFQoJCAsCBBYCAwECHgECF4AZGGh0dHBzOi8va2V5cy5vcGVucGdwLm9y
-ZxYhBDY3ICUj58Ewmreeme8txYJ7RF9LBQJhhrogJxSAAAAAABAADnByb29mQGFy
-aWFkbmUuaWRkbnM6ZG9pcC5yb2NrcwAKCRDvLcWCe0RfS6LbC/9mdVWS8qiZcM0b
-tcekjGXXDKWggdeYVxHMcSCypvuI7Rha8vRKGnfvtY6Wy36YsW40u6vdaw4UIFGy
-6Y/8RhaT6eN0EZ8t4VQv8HXyHeWqqQSfBpyU77spcxv27Wo24OhrI9ErmxXHAjqk
-Hp46lA1nJjGRkzQs09KFRPd4nL4NInV1me1G8szxzowlLbRIZ3bNqhnPTeVOa779
-j8aupCr0W08W0f6FxcDxGgQBT1ytLcc1nQdhgkXppTlso+JvOr2sjff4suSXY3gC
-GcTGwRX15q3YDTv36KtlBlus2f4oGk1mjqZAESklrTHCfifZW102mkKBzZ+Y0EwN
-B9ODBwJNrsbqBqXMs1wQkP81O3ihONwhz5XuykJF3G0VeoOy1zSL4ghZQ4/XkWyp
-fCRSXrr7SZxIu7I8jfQrxc0k9XhpPI/gdlgRqoEG2lMyqFaWzyoI9dyoVwji78rg
-8t7V+BjcvC8fJHgXUZxljqi2ZfcismJE6Hyn6qsdlNF9SKWOIIg=
-=Csr+
------END PGP PUBLIC KEY BLOCK-----`
+const pubKeyPlaintext = publicKeyArmored
 
 const pubKeyWithOtherNotations = `-----BEGIN PGP PUBLIC KEY BLOCK-----
 
@@ -89,20 +68,45 @@ Q+AZdYCbM0hdBjP4xdKZcpqak8ksb+aQFXjGacDL/XN4VrP+tBGxkqIqreoDcgIb
 =tVW7
 -----END PGP PUBLIC KEY BLOCK-----`
 
+let openPgpFixture
+
+function useOpenPgpFixtureHkp () {
+  before(async () => {
+    openPgpFixture = await installOpenPgpFixtureHkp()
+  })
+
+  after(() => {
+    openPgpFixture.restore()
+  })
+}
+
 describe('openpgp.fetch', () => {
+  useOpenPgpFixtureHkp()
+
   it('should be a function (1 argument)', () => {
     expect(openpgp.fetch).to.be.a('function')
     expect(openpgp.fetch).to.have.length(1)
   })
   it('should return a Key object when provided a valid fingerprint', async () => {
-    expect(
-      await openpgp.fetch(pubKeyFingerprint)
-    ).to.be.instanceOf(Profile)
+    const profile = await openpgp.fetch(pubKeyFingerprint)
+    expect(profile).to.be.instanceOf(Profile)
+    expect(profile.publicKey.fetch.method).to.be.equal('hkp')
+    expect(profile.publicKey.fetch.query).to.be.equal(pubKeyFingerprint)
+    expect(openPgpFixture.calls.at(-1)).to.include({
+      protocol: 'hkp',
+      query: pubKeyFingerprint,
+      baseUrl: 'https://keys.openpgp.org'
+    })
   }).timeout('12s')
   it('should return a Key object when provided a valid email address', async () => {
-    expect(
-      await openpgp.fetch(pubKeyEmail)
-    ).to.be.instanceOf(Profile)
+    const profile = await openpgp.fetch(pubKeyEmail)
+    expect(profile).to.be.instanceOf(Profile)
+    expect(profile.publicKey.fetch.method).to.be.equal('hkp')
+    expect(profile.publicKey.fetch.query).to.be.equal(pubKeyEmail)
+    expect(openPgpFixture.calls.slice(-2).map(({ protocol }) => protocol)).to.deep.equal([
+      'wkd',
+      'hkp'
+    ])
   }).timeout('12s')
   it('should reject when provided an invalid email address', () => {
     return expect(
@@ -112,14 +116,17 @@ describe('openpgp.fetch', () => {
 })
 
 describe('openpgp.fetchURI', () => {
+  useOpenPgpFixtureHkp()
+
   it('should be a function (1 argument)', () => {
     expect(openpgp.fetchURI).to.be.a('function')
     expect(openpgp.fetchURI).to.have.length(1)
   })
   it('should return a Key object when provided a hkp: uri', async () => {
-    expect(
-      await openpgp.fetchURI(`hkp:${pubKeyFingerprint}`)
-    ).to.be.instanceOf(Profile)
+    const profile = await openpgp.fetchURI(`hkp:${pubKeyFingerprint}`)
+    expect(profile).to.be.instanceOf(Profile)
+    expect(profile.publicKey.fetch.method).to.be.equal('hkp')
+    expect(profile.publicKey.fetch.query).to.be.equal(pubKeyFingerprint)
   }).timeout('12s')
   it('should reject when provided an invalid uri', () => {
     return expect(
@@ -129,19 +136,23 @@ describe('openpgp.fetchURI', () => {
 })
 
 describe('openpgp.fetchHKP', () => {
+  useOpenPgpFixtureHkp()
+
   it('should be a function (1 required argument, 1 optional argument)', () => {
     expect(openpgp.fetchHKP).to.be.a('function')
     expect(openpgp.fetchHKP).to.have.length(1)
   })
   it('should return a Key object when provided a valid fingerprint', async () => {
-    expect(await openpgp.fetchHKP(pubKeyFingerprint)).to.be.instanceOf(
-      Profile
-    )
+    const profile = await openpgp.fetchHKP(pubKeyFingerprint)
+    expect(profile).to.be.instanceOf(Profile)
+    expect(profile.publicKey.fetch.method).to.be.equal('hkp')
+    expect(profile.publicKey.fetch.query).to.be.equal(pubKeyFingerprint)
   }).timeout('12s')
   it('should return a Key object when provided a valid email address', async () => {
-    expect(await openpgp.fetchHKP(pubKeyEmail)).to.be.instanceOf(
-      Profile
-    )
+    const profile = await openpgp.fetchHKP(pubKeyEmail)
+    expect(profile).to.be.instanceOf(Profile)
+    expect(profile.publicKey.fetch.method).to.be.equal('hkp')
+    expect(profile.publicKey.fetch.query).to.be.equal(pubKeyEmail)
   }).timeout('12s')
   it('should reject when provided an invalid fingerprint', async () => {
     return expect(

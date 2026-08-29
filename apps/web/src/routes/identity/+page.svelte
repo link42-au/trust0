@@ -16,8 +16,12 @@
 		fetchChain,
 		appendAfterAction,
 		rotateKey,
+		detectKeyRotationRecovery,
+		resumeKeyRotation,
+		KeyRotationProfileUpdateError,
 		type ChainLink,
 		type ChainResponse,
+		type KeyRotationRecovery,
 		type MyProfile,
 		type StoredIdentity
 	} from "$lib/identity";
@@ -72,6 +76,9 @@
 	// Key rotation state
 	let rotating = $state(false);
 	let showRotateConfirm = $state(false);
+	let rotationRecovery = $state<KeyRotationRecovery | null>(null);
+	let recoveringRotation = $state(false);
+	let rotationRecoveryNotice = $state<string | null>(null);
 
 	// Paper key state
 	let showPaperKey = $state(false);
@@ -116,12 +123,16 @@
 			} catch { /* QR generation is supplementary */ }
 		}
 
-		// Load chain if identity exists
+		// During interrupted rotation, the server still indexes the old fingerprint.
 		if (identity) {
 			try {
-				chain = await fetchChain(identity.fingerprint);
+				const chainLookup = serverProfile && serverProfile.fingerprint !== identity.fingerprint
+					? serverProfile.fingerprint
+					: identity.fingerprint;
+				chain = await fetchChain(chainLookup);
 				if (chain) {
 					identityId = chain.identityId;
+					if (serverProfile) rotationRecovery = await detectKeyRotationRecovery(identity, serverProfile.fingerprint, chain);
 				}
 			} catch (err) {
 				console.error("Chain fetch failed:", err);
@@ -200,8 +211,16 @@
 		attestingEmail = true;
 		error = null;
 		try {
-			// Step 1: Request challenge (server sends email)
-			const { challenge, email } = await requestEmailChallenge();
+			// Step 1: Request challenge (server sends email only)
+			const { email } = await requestEmailChallenge();
+
+			const challenge = window.prompt(
+				`Check ${email} for your verification challenge, then paste it here to continue.`,
+			)?.trim();
+
+			if (!challenge) {
+				throw new Error("Email verification cancelled");
+			}
 
 			// Step 2: Sign challenge with identity key and submit
 			const { email: verifiedEmail } = await verifyEmailChallenge(identity, challenge);
@@ -237,10 +256,14 @@
 
 	async function handleSaveProfile() {
 		if (!identity || !editName.trim()) return;
+		if (rotationRecovery) {
+			error = "Finish the pending key rotation before editing your profile.";
+			return;
+		}
 		saving = true;
 		error = null;
 		try {
-			await updateProfile(identity, editName.trim(), parsedClaims, editDescription?.trim() || undefined, editAvatarUrl?.trim() || undefined, editColor || undefined);
+			await updateProfile(identity, editName.trim(), parsedClaims, editDescription?.trim() || undefined, editAvatarUrl?.trim() || undefined, editColor || undefined, serverProfile?.fingerprint);
 			serverProfile = await fetchMyProfile();
 			if (serverProfile) {
 				const parsed = await parseProfile(serverProfile.profileJws);
@@ -297,6 +320,8 @@
 				profileName,
 				parsedClaims,
 				profileDescription,
+				profileAvatarUrl,
+				profileColor,
 			);
 			identity = newIdentity;
 			serverProfile = await fetchMyProfile();
@@ -306,11 +331,55 @@
 				profileName = parsed.name;
 			}
 			chain = await fetchChain(identityId);
+			rotationRecovery = null;
+			rotationRecoveryNotice = "Key rotation complete. Your public profile now uses the new key.";
 			showRotateConfirm = false;
 		} catch (e) {
-			error = e instanceof Error ? e.message : "Key rotation failed";
+			if (e instanceof KeyRotationProfileUpdateError) {
+				identity = e.identity;
+				chain = await fetchChain(identityId);
+				rotationRecovery = { phase: e.phase, targetFingerprint: e.targetFingerprint };
+				showRotateConfirm = false;
+				error = null;
+			} else {
+				error = e instanceof Error ? e.message : "Key rotation failed";
+			}
 		}
 		rotating = false;
+	}
+
+	async function handleResumeKeyRotation() {
+		if (!identity || !identityId || !serverProfile || !rotationRecovery) return;
+		recoveringRotation = true;
+		error = null;
+		rotationRecoveryNotice = null;
+		try {
+			await resumeKeyRotation(identity, identityId, serverProfile.fingerprint, {
+				name: profileName,
+				claims: parsedClaims,
+				description: profileDescription,
+				avatarUrl: profileAvatarUrl,
+				color: profileColor,
+			});
+			serverProfile = await fetchMyProfile();
+			if (!serverProfile) throw new Error("The updated profile could not be loaded");
+			const parsed = await parseProfile(serverProfile.profileJws);
+			parsedClaims = parsed.claims;
+			profileName = parsed.name;
+			profileDescription = parsed.description;
+			profileAvatarUrl = parsed.avatarUrl;
+			profileColor = parsed.color;
+			chain = await fetchChain(identityId);
+			rotationRecovery = null;
+			rotationRecoveryNotice = "Key rotation complete. Your public profile now uses the new key.";
+		} catch (e) {
+			if (e instanceof KeyRotationProfileUpdateError) {
+				identity = e.identity;
+				rotationRecovery = { phase: e.phase, targetFingerprint: e.targetFingerprint };
+			}
+			error = e instanceof Error ? e.message : "Key rotation recovery failed";
+		}
+		recoveringRotation = false;
 	}
 
 	async function handleShowPaperKey() {
@@ -534,7 +603,20 @@
 	</div>
 
 	{#if error}
-		<div class="error-state" style="color: var(--red); margin-bottom: 16px;">{error}</div>
+		<div class="error-state" role="alert" style="color: var(--red); margin-bottom: 16px;">{error}</div>
+	{/if}
+	{#if rotationRecovery}
+		<div class="error-state" role="status" aria-live="polite" style="margin-bottom: 16px;">
+			<strong>Key rotation needs one more step.</strong>
+			<p>{rotationRecovery.phase === "chain-profile-update"
+				? "Your new key is safely stored, but the signed identity history still needs to name it as your profile key."
+				: "Your signed identity history is ready, but your public profile still uses the previous key."}</p>
+			<button class="btn-sm" onclick={handleResumeKeyRotation} aria-busy={recoveringRotation} disabled={recoveringRotation}>
+				{recoveringRotation ? "Finishing..." : "Finish key rotation"}
+			</button>
+		</div>
+	{:else if rotationRecoveryNotice}
+		<div role="status" aria-live="polite" style="margin-bottom: 16px; color: var(--accent);">{rotationRecoveryNotice}</div>
 	{/if}
 		<div class="grid">
 			<div class="card">
@@ -612,7 +694,7 @@
 					{/if}
 
 					<div class="profile-detail" style="display: flex; gap: 8px;">
-						<button class="outline btn-sm" onclick={startEditing}>Edit Profile</button>
+						<button class="outline btn-sm" onclick={startEditing} disabled={Boolean(rotationRecovery)}>Edit Profile</button>
 						<button class="outline btn-sm" onclick={handleExportProfile}>Download Profile</button>
 					</div>
 				{/if}
@@ -765,12 +847,12 @@
 						<button class="outline btn-sm" onclick={handleExportSshKey}>Export SSH Key</button>
 						{#if showSshKey}
 							<div class="ssh-export" style="margin-top: 12px;">
-								<label>SSH Public Key</label>
+								<div style="font-weight: 600; margin-bottom: 4px;">SSH Public Key</div>
 								<div class="proof-box">
 									<code style="font-size: 0.7rem; word-break: break-all;">{sshPublicKey}</code>
 									<button class="btn-sm secondary" onclick={() => navigator.clipboard.writeText(sshPublicKey)}>Copy</button>
 								</div>
-								<label style="margin-top: 8px;">Git Config</label>
+								<div style="font-weight: 600; margin: 8px 0 4px;">Git Config</div>
 								<pre style="font-size: 0.75rem; padding: 12px; background: var(--bg-subtle); border-radius: 8px; overflow-x: auto;">git config --global gpg.format ssh
 git config --global user.signingkey ~/.ssh/identity_ed25519.pub
 git config --global commit.gpgsign true</pre>
@@ -855,9 +937,8 @@ git config --global commit.gpgsign true</pre>
 			{/if}
 		</div>
 	{/if}
-{/if}
 
-<style>
+	<style>
 	/* ── Onboarding ─────────────────────────────── */
 
 	.onboarding {

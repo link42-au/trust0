@@ -128,5 +128,4 @@
 
 <style>
 	.proof-box { display: flex; align-items: center; gap: 8px; padding: 12px; background: var(--bg-subtle); border: 1px solid var(--border); border-radius: 8px; margin: 12px 0; }
-	.proof-box code { flex: 1; word-break: break-all; background: transparent; border: none; padding: 0; }
 </style>

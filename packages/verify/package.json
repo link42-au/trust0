@@ -13,6 +13,12 @@
     },
     "./fetchers-minimal": {
       "default": "./src/fetcher/index.minimal.js"
+    },
+    "./claim": {
+      "default": "./src/claim.js"
+    },
+    "./enums": {
+      "default": "./src/enums.js"
     }
   },
   "dependencies": {

@@ -1,14 +1,17 @@
 import {
 	type ChainLinkType,
+	type ChainState,
 	computeFingerprint,
 	computeLinkHash,
 	createChainLink,
 	createProfile,
 	createRequest,
 	generateIdentityKey,
+	verifyChain,
 } from "@trust0/identity";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8788";
+const ASPE_DOMAIN = import.meta.env.VITE_ASPE_DOMAIN || "trust0.app";
 
 // ── Key Storage (IndexedDB — CryptoKey objects stored as opaque handles) ────
 
@@ -17,6 +20,30 @@ export interface StoredIdentity {
 	publicKey: CryptoKey;
 	publicJWK: JsonWebKey;
 	fingerprint: string;
+}
+
+export type KeyRotationRecoveryPhase = "chain-profile-update" | "public-profile-update";
+
+export interface KeyRotationRecovery {
+	phase: KeyRotationRecoveryPhase;
+	targetFingerprint: string;
+}
+
+export class KeyRotationProfileUpdateError extends Error {
+	readonly identity: StoredIdentity;
+	readonly phase: KeyRotationRecoveryPhase;
+	readonly targetFingerprint: string;
+
+	constructor(identity: StoredIdentity, phase: KeyRotationRecoveryPhase, targetFingerprint: string, cause: unknown) {
+		const step = phase === "chain-profile-update"
+			? "the signed identity history could not record the new profile key"
+			: "the public profile could not be replaced with the new key";
+		super(`The new key is safely stored, but ${step}. Retry to finish the rotation: ${cause instanceof Error ? cause.message : "Unknown error"}`, { cause });
+		this.name = "KeyRotationProfileUpdateError";
+		this.identity = identity;
+		this.phase = phase;
+		this.targetFingerprint = targetFingerprint;
+	}
 }
 
 const DB_NAME = "trust0_identity";
@@ -58,20 +85,27 @@ export async function getStoredIdentity(): Promise<StoredIdentity | null> {
 	}
 }
 
-export async function generateAndStoreIdentity(): Promise<StoredIdentity> {
+async function generateIdentity(): Promise<StoredIdentity> {
 	const { privateKey, publicKey, publicJWK } = await generateIdentityKey();
 	const fingerprint = await computeFingerprint(publicJWK);
+	return { privateKey, publicKey, publicJWK, fingerprint };
+}
 
+async function storeIdentity(identity: StoredIdentity): Promise<void> {
 	const db = await openIdentityDB();
 	await new Promise<void>((resolve, reject) => {
 		const tx = db.transaction(STORE_NAME, "readwrite");
 		const store = tx.objectStore(STORE_NAME);
-		store.put({ privateKey, publicKey, publicJWK, fingerprint }, KEY_ID);
+		store.put(identity, KEY_ID);
 		tx.oncomplete = () => resolve();
 		tx.onerror = () => reject(tx.error);
 	});
+}
 
-	return { privateKey, publicKey, publicJWK, fingerprint };
+export async function generateAndStoreIdentity(): Promise<StoredIdentity> {
+	const identity = await generateIdentity();
+	await storeIdentity(identity);
+	return identity;
 }
 
 export async function clearStoredIdentity(): Promise<void> {
@@ -102,6 +136,10 @@ export interface MyProfile {
 	username: string | null;
 	createdAt: string;
 	updatedAt: string;
+}
+
+function getAspeUri(fingerprint: string): string {
+	return `aspe:${ASPE_DOMAIN}:${fingerprint}`;
 }
 
 export async function fetchMyProfile(): Promise<MyProfile | null> {
@@ -168,6 +206,7 @@ export async function updateProfile(
 	description?: string,
 	avatarUrl?: string,
 	color?: string,
+	targetFingerprint?: string,
 ): Promise<void> {
 	const profileJws = await createProfile({
 		name,
@@ -183,7 +222,7 @@ export async function updateProfile(
 	const requestJws = await createRequest({
 		action: "update",
 		profileJws,
-		aspeUri: `aspe:${identity.fingerprint}`,
+		aspeUri: getAspeUri(targetFingerprint ?? identity.fingerprint),
 		key: identity.privateKey,
 		publicJWK: identity.publicJWK,
 		fingerprint: identity.fingerprint,
@@ -349,7 +388,6 @@ export async function claimUsername(
 // ── Email Challenge-Response Verification ──────────────────────────────────
 
 export async function requestEmailChallenge(): Promise<{
-	challenge: string;
 	email: string;
 	expiresAt: string;
 }> {
@@ -363,7 +401,7 @@ export async function requestEmailChallenge(): Promise<{
 		throw new Error(err.error);
 	}
 
-	return (await res.json()) as { challenge: string; email: string; expiresAt: string };
+	return (await res.json()) as { email: string; expiresAt: string };
 }
 
 export async function verifyEmailChallenge(
@@ -506,18 +544,98 @@ export async function appendAfterAction(
 
 // ── Key Rotation ──────────────────────────────────────────────────────────
 
-export async function rotateKey(
+export interface KeyRotationOperations {
+	generateIdentity: () => Promise<StoredIdentity>;
+	appendAfterAction: typeof appendAfterAction;
+	storeIdentity: (identity: StoredIdentity) => Promise<void>;
+	updateProfile: typeof updateProfile;
+}
+
+export interface ProfileTransitionDetails {
+	name: string;
+	claims: string[];
+	description?: string;
+	avatarUrl?: string;
+	color?: string;
+}
+
+async function completeKeyRotationProfileTransition(
+	identity: StoredIdentity,
+	identityId: string,
+	targetFingerprint: string,
+	details: ProfileTransitionDetails,
+	appendProfileUpdate: boolean,
+	operations: Pick<KeyRotationOperations, "appendAfterAction" | "updateProfile">,
+): Promise<void> {
+	if (appendProfileUpdate) {
+		try {
+			await operations.appendAfterAction(identity, identityId, "profile_update", { profile_fingerprint: identity.fingerprint });
+		} catch (cause) {
+			throw new KeyRotationProfileUpdateError(identity, "chain-profile-update", targetFingerprint, cause);
+		}
+	}
+	try {
+		await operations.updateProfile(identity, details.name, details.claims, details.description, details.avatarUrl, details.color, targetFingerprint);
+	} catch (cause) {
+		throw new KeyRotationProfileUpdateError(identity, "public-profile-update", targetFingerprint, cause);
+	}
+}
+
+export function classifyKeyRotationRecovery(
+	storedFingerprint: string,
+	serverFingerprint: string,
+	state: Pick<ChainState, "activeFingerprints" | "currentProfileFingerprint">,
+): KeyRotationRecovery | null {
+	if (storedFingerprint === serverFingerprint) return null;
+	if (!state.activeFingerprints.has(storedFingerprint)) throw new Error("The stored key is not authorized by this identity's signed history");
+	if (!state.activeFingerprints.has(serverFingerprint)) throw new Error("The public profile key is not active in this identity's signed history");
+	if (state.currentProfileFingerprint === storedFingerprint) return { phase: "public-profile-update", targetFingerprint: serverFingerprint };
+	if (state.currentProfileFingerprint === null || state.currentProfileFingerprint === serverFingerprint) return { phase: "chain-profile-update", targetFingerprint: serverFingerprint };
+	throw new Error("The signed identity history names a different profile key");
+}
+
+export async function detectKeyRotationRecovery(
+	identity: StoredIdentity,
+	serverFingerprint: string,
+	chain: ChainResponse,
+): Promise<KeyRotationRecovery | null> {
+	const state = await verifyChain(chain.links.map((link) => link.linkJws), chain.identityId);
+	return classifyKeyRotationRecovery(identity.fingerprint, serverFingerprint, state);
+}
+
+export interface KeyRotationRecoveryOperations {
+	fetchChain: typeof fetchChain;
+	detectKeyRotationRecovery: typeof detectKeyRotationRecovery;
+	appendAfterAction: typeof appendAfterAction;
+	updateProfile: typeof updateProfile;
+}
+
+export async function resumeKeyRotation(
+	identity: StoredIdentity,
+	identityId: string,
+	serverFingerprint: string,
+	details: ProfileTransitionDetails,
+	operations: KeyRotationRecoveryOperations = { fetchChain, detectKeyRotationRecovery, appendAfterAction, updateProfile },
+): Promise<void> {
+	const chain = await operations.fetchChain(identityId);
+	if (!chain) throw new Error("The signed identity history could not be loaded");
+	const recovery = await operations.detectKeyRotationRecovery(identity, serverFingerprint, chain);
+	if (!recovery) return;
+	await completeKeyRotationProfileTransition(identity, identityId, recovery.targetFingerprint, details, recovery.phase === "chain-profile-update", operations);
+}
+
+export async function executeKeyRotation(
 	oldIdentity: StoredIdentity,
 	identityId: string,
 	name: string,
 	claims: string[],
-	description?: string,
+	description: string | undefined,
+	avatarUrl: string | undefined,
+	color: string | undefined,
+	operations: KeyRotationOperations,
 ): Promise<StoredIdentity> {
-	// 1. Generate new keypair
-	const newIdentity = await generateAndStoreIdentity();
-
-	// 2. Append key_rotate link signed by OLD key
-	await appendAfterAction(oldIdentity, identityId, "key_rotate", {
+	const newIdentity = await operations.generateIdentity();
+	await operations.appendAfterAction(oldIdentity, identityId, "key_rotate", {
 		new_fingerprint: newIdentity.fingerprint,
 		new_jwk: {
 			kty: newIdentity.publicJWK.kty,
@@ -526,15 +644,21 @@ export async function rotateKey(
 		},
 	});
 
-	// 3. Create new profile with new key
-	await uploadProfile(newIdentity, name, claims, description);
-
-	// 4. Append profile_update link signed by NEW key (now authorized via rotation)
-	await appendAfterAction(newIdentity, identityId, "profile_update", {
-		profile_fingerprint: newIdentity.fingerprint,
-	});
-
+	await operations.storeIdentity(newIdentity);
+	await completeKeyRotationProfileTransition(newIdentity, identityId, oldIdentity.fingerprint, { name, claims, description, avatarUrl, color }, true, operations);
 	return newIdentity;
+}
+
+export async function rotateKey(
+	oldIdentity: StoredIdentity,
+	identityId: string,
+	name: string,
+	claims: string[],
+	description?: string,
+	avatarUrl?: string,
+	color?: string,
+): Promise<StoredIdentity> {
+	return executeKeyRotation(oldIdentity, identityId, name, claims, description, avatarUrl, color, { generateIdentity, appendAfterAction, storeIdentity, updateProfile });
 }
 
 export async function fetchIdentityById(identityId: string): Promise<{

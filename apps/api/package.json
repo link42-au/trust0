@@ -6,6 +6,7 @@
 	"scripts": {
 		"dev": "wrangler dev",
 		"deploy": "wrangler deploy",
+		"test": "vitest run",
 		"db:generate": "drizzle-kit generate",
 		"db:migrate:local": "wrangler d1 migrations apply trust0-db --local",
 		"db:migrate:remote": "wrangler d1 migrations apply trust0-db --remote"
@@ -21,6 +22,7 @@
 	"devDependencies": {
 		"@cloudflare/workers-types": "^4.20241230.0",
 		"drizzle-kit": "^0.30.0",
+		"vitest": "^4.0.0",
 		"wrangler": "^4.14.0"
 	}
 }

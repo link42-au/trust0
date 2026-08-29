@@ -6,3 +6,5 @@ export { signDocument, verifyDocumentSignature, submitToRekor, jwkToPublicKeyPem
 export type { SignatureBundle, SignDocumentParams, VerifiedSignature, RekorTimestamp, MultiSignatureBundle } from "./signing.js";
 export { jwkToSshPublicKey, gitSigningConfig } from "./ssh.js";
 export { keyToMnemonic, mnemonicToKey, isValidMnemonic } from "./mnemonic.js";
+export { parseAspeUri } from "./aspe.js";
+export type { ParsedAspeUri } from "./aspe.js";

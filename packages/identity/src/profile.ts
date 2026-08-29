@@ -112,8 +112,17 @@ export async function parseProfile(jws: string): Promise<ParsedProfile> {
     throw new Error("Unsupported profile payload version");
   }
 
-  // TODO (APC-003): Check exp claim if present and reject expired profiles.
-  // See: dev/spec/proposed-changes.md#apc-003
+  const exp = decodedPayload.exp;
+  if (exp !== undefined) {
+    if (typeof exp !== "number") {
+      throw new Error("Invalid profile expiration");
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    if (exp <= now) {
+      throw new Error("Profile has expired");
+    }
+  }
 
   const name = decodedPayload["http://ariadne.id/name"];
   const claims = decodedPayload["http://ariadne.id/claims"];

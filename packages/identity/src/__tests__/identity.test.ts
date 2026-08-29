@@ -1,4 +1,4 @@
-import { compactVerify, decodeProtectedHeader, importJWK } from "jose";
+import { CompactSign, compactVerify, decodeProtectedHeader, importJWK } from "jose";
 import { describe, expect, it } from "vitest";
 import {
   computeFingerprint,
@@ -136,6 +136,23 @@ describe("identity", () => {
     const tampered = `${headerPart}.${tamperedPayload}.${signaturePart}`;
 
     await expect(parseProfile(tampered)).rejects.toThrow();
+  });
+
+  it("parseProfile rejects expired profiles when exp is present", async () => {
+    const { privateKey, publicJWK } = await generateIdentityKey();
+    const fingerprint = await computeFingerprint(publicJWK);
+
+    const expiredProfile = await new CompactSign(new TextEncoder().encode(JSON.stringify({
+      "http://ariadne.id/version": 0,
+      "http://ariadne.id/type": "profile",
+      "http://ariadne.id/name": "alice",
+      "http://ariadne.id/claims": ["claim:a"],
+      exp: Math.floor(Date.now() / 1000) - 60,
+    })))
+      .setProtectedHeader({ typ: "JWT", alg: "EdDSA", kid: fingerprint, jwk: { kty: "OKP", crv: "Ed25519", x: publicJWK.x! } })
+      .sign(privateKey);
+
+    await expect(parseProfile(expiredProfile)).rejects.toThrow("Profile has expired");
   });
 
   it("createRequest produces valid JWS with expected payload", async () => {
