@@ -1,6 +1,8 @@
 node_modules/
 dist/
 .svelte-kit/
+playwright-report/
+test-results/
 .wrangler/
 .env
 .env.*

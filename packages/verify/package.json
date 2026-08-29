@@ -73,6 +73,7 @@
     "docs:lib": "jsdoc -c jsdoc-lib.json -r -d ./docs -P package.json",
     "lint": "eslint ./src",
     "lint:fix": "eslint ./src --fix",
+    "check": "pnpm lint && pnpm license:check",
     "pretest": "node ./prerelease.js && npm run lint && npm run license:check",
     "test": "mocha",
     "prepare": "true",

@@ -18,6 +18,7 @@
     "vitest": "^4.0.0"
   },
   "scripts": {
+    "check": "pnpm test",
     "test": "vitest run",
     "test:watch": "vitest"
   }
