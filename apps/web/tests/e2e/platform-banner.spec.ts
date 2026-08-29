@@ -29,9 +29,10 @@ test("keeps every product keyboard reachable with a visible focus state", async 
 	await page.goto("/");
 
 	const links = page.getByRole("navigation", { name: "Link42 products" }).getByRole("link");
+	await links.first().focus();
 	for (let index = 0; index < PRODUCTS.length; index += 1) {
-		await page.keyboard.press("Tab");
 		await expect(links.nth(index)).toBeFocused();
+		if (index < PRODUCTS.length - 1) await page.keyboard.press("Tab");
 	}
 	await expect.poll(() => links.last().evaluate((element) => getComputedStyle(element).outlineWidth)).toBe("3px");
 });

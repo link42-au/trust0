@@ -40,3 +40,38 @@ export async function mockGetMe(
 		});
 	});
 }
+
+export async function mockAuthSession(
+	page: Page,
+	initialMe: MeResponse | null,
+): Promise<void> {
+	let currentMe = initialMe;
+	await page.route("**/api/**", async (route) => {
+		const request = route.request();
+		const pathname = new URL(request.url()).pathname;
+		if (pathname === "/api/me") {
+			if (currentMe === null) {
+				await route.fulfill({
+					status: 401,
+					contentType: "application/json",
+					body: JSON.stringify({ error: "Unauthorized" }),
+				});
+				return;
+			}
+			await route.fulfill({
+				status: 200,
+				contentType: "application/json",
+				body: JSON.stringify(currentMe),
+			});
+			return;
+		}
+
+		if (pathname === "/api/auth/sign-out" && request.method() === "POST") {
+			currentMe = null;
+			await route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
+			return;
+		}
+
+		await route.abort("blockedbyclient");
+	});
+}
