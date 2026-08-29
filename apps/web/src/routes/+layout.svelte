@@ -34,6 +34,16 @@
 	}
 </script>
 
+<nav class="platform-banner" aria-label="Link42 products">
+	<div class="platform-products">
+		<a class="platform-product" href="https://link42.app">link42</a>
+		<a class="platform-product" href="https://rule1.link42.app">rule1</a>
+		<a class="platform-product" href="https://patch8.link42.app">patch8</a>
+		<a class="platform-product" href="https://threat10.link42.app">threat10</a>
+		<a class="platform-product platform-product-current" href="https://trust0.link42.app" aria-current="page">trust0</a>
+	</div>
+</nav>
+
 <nav class="topbar">
 	<div class="topbar-inner">
 		<a href="/" class="logo">
@@ -98,6 +108,52 @@
 </footer>
 
 <style>
+	.platform-banner {
+		background: var(--bg-subtle);
+		border-bottom: 1px solid var(--border);
+	}
+
+	.platform-products {
+		max-width: 960px;
+		min-height: 42px;
+		margin: 0 auto;
+		padding: 6px 24px;
+		display: flex;
+		align-items: center;
+		gap: 6px;
+	}
+
+	.platform-product {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-height: 30px;
+		padding: 4px 10px;
+		border: 1px solid transparent;
+		border-radius: 7px;
+		color: var(--text-dim);
+		font-family: var(--font-mono);
+		font-size: 0.7rem;
+		font-weight: 500;
+		line-height: 1;
+		text-decoration: none;
+		white-space: nowrap;
+	}
+
+	.platform-product:hover {
+		background: var(--bg-hover);
+		color: var(--text);
+		text-decoration: none;
+	}
+
+	.platform-product-current {
+		background: var(--bg-card);
+		border-color: var(--border-strong);
+		box-shadow: inset 0 -2px var(--accent);
+		color: var(--text);
+		font-weight: 600;
+	}
+
 	.topbar {
 		border-bottom: 1px solid var(--border);
 		padding: 12px 24px;
@@ -257,4 +313,19 @@
 	.footer-links { margin-top: 4px; }
 	.footer-links a { color: var(--text-dim); }
 	.sep { margin: 0 4px; opacity: 0.3; }
+
+	@media (max-width: 420px) {
+		.platform-products {
+			display: grid;
+			grid-template-columns: repeat(5, minmax(0, 1fr));
+			gap: 6px;
+			padding: 6px 8px;
+		}
+
+		.platform-product {
+			min-width: 0;
+			padding-inline: 2px;
+			font-size: 0.625rem;
+		}
+	}
 </style>
