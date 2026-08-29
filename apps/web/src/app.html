@@ -1,21 +1,24 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="light">
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="color-scheme" content="light dark" />
 		<title>trust0</title>
 		<meta name="description" content="Cryptographic identity verification. Trust no one. Verify everything." />
 		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 		<link rel="preconnect" href="https://fonts.googleapis.com" />
 		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-		<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+		<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@300;400;500&display=swap" rel="stylesheet" />
 		<script>
 			(() => {
 				var m = document.cookie.match(/(?:^|;\s*)theme=(light|dark)/);
-				var t = m ? m[1] : null;
-				if (t === 'light') {
-					document.documentElement.setAttribute('data-theme', 'light');
-				}
+				var s = null;
+				try { s = localStorage.getItem('link42-theme'); } catch {}
+				var t = m ? m[1] : (s === 'light' || s === 'dark' ? s : null);
+				if (!t) t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+				document.documentElement.setAttribute('data-theme', t);
+				document.documentElement.style.colorScheme = t;
 			})();
 		</script>
 		%sveltekit.head%

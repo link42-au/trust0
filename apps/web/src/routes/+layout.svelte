@@ -2,11 +2,17 @@
 	import "../app.css";
 	import { onMount } from "svelte";
 	import { getMe, signInWithGitHub, signOut, type MeResponse } from "$lib/api";
+	import { initializeTheme, toggleTheme, watchSystemTheme } from "$lib/theme";
 
 	let { children } = $props();
 	let me = $state<MeResponse | null>(null);
 	let showMenu = $state(false);
 	let signingIn = $state(false);
+
+	onMount(() => {
+		initializeTheme();
+		return watchSystemTheme();
+	});
 
 	onMount(async () => {
 		me = await getMe();
@@ -34,6 +40,10 @@
 			<span class="logo-text">trust<span class="logo-zero">0</span></span>
 		</a>
 		<div class="nav-links">
+			<button class="theme-toggle" onclick={toggleTheme} aria-label="Toggle color theme" title="Toggle color theme">
+				<span class="theme-icon theme-icon-light" aria-hidden="true">☾</span>
+				<span class="theme-icon theme-icon-dark" aria-hidden="true">☀</span>
+			</button>
 			{#if me}
 				<a href="/identity">My Identity</a>
 				<a href="/identity/sign">Sign</a>
@@ -125,6 +135,23 @@
 
 	.nav-links a { color: var(--text-dim); text-decoration: none; }
 	.nav-links a:hover { color: var(--text); }
+
+	.theme-toggle {
+		display: inline-grid;
+		place-items: center;
+		width: 34px;
+		height: 34px;
+		padding: 0;
+		border: 1px solid var(--border-strong);
+		border-radius: 6px;
+		background: var(--bg-subtle);
+		color: var(--text);
+		font-size: 1rem;
+	}
+
+	.theme-toggle:hover { background: var(--bg-hover); opacity: 1; }
+	:global([data-theme="light"]) .theme-icon-dark { display: none; }
+	:global([data-theme="dark"]) .theme-icon-light { display: none; }
 
 	.btn-login {
 		padding: 8px 16px;
